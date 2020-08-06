@@ -3,9 +3,13 @@ import hashlib
 import os
 import logging
 import re
+from concurrent import futures
+
+import tempfile
 import xml.etree.ElementTree as ET
 import zipfile
 
+from django.conf import settings
 from django.core.files import File
 from django.core.files.storage import default_storage
 from django.template import Context, Template
@@ -13,6 +17,7 @@ from django.utils import timezone
 from webob import Response
 import pkg_resources
 
+from openedx.core.djangoapps.site_configuration import helpers as configuration_helpers
 from web_fragments.fragment import Fragment
 from xblock.core import XBlock
 from xblock.fields import Scope, String, Float, Boolean, Dict, DateTime, Integer
@@ -173,31 +178,31 @@ class ScormXBlock(XBlock):
         package_file = request.params["file"].file
         self.update_package_meta(package_file)
 
-        # First, save scorm file in the storage for mobile clients
-        if default_storage.exists(self.package_path):
-            logger.info('Removing previously uploaded "%s"', self.package_path)
-            default_storage.delete(self.package_path)
-        default_storage.save(self.package_path, File(package_file))
-        logger.info('Scorm "%s" file stored at "%s"', package_file, self.package_path)
-
-        # Then, extract zip file
         if default_storage.exists(self.extract_folder_base_path):
             logger.info(
-                'Removing previously unzipped "%s"', self.extract_folder_base_path
+                'Removing previously uploaded "%s"', self.extract_folder_base_path
             )
             recursive_delete(self.extract_folder_base_path)
-        with zipfile.ZipFile(package_file, "r") as scorm_zipfile:
-            for zipinfo in scorm_zipfile.infolist():
-                default_storage.save(
-                    os.path.join(self.extract_folder_path, zipinfo.filename),
-                    scorm_zipfile.open(zipinfo.filename),
-                )
 
+        with tempfile.TemporaryDirectory() as tempdir:
+            logger.info('Scorm "%s" unpacked to "%s"', package_file, tempdir)
+            with zipfile.ZipFile(package_file, "r") as scorm_zipfile:
+                scorm_zipfile.extractall(tempdir)
+
+            logger.info('Starting uploading files')
+
+            with futures.ThreadPoolExecutor(max_workers=min(32, os.cpu_count() + 4)) as p:
+                for root, subs, files in os.walk(tempdir):
+                    rel_dir = os.path.relpath(root, tempdir)
+                    for filename in files:
+                        p.submit(upload_file, self.extract_folder_path, root, rel_dir, filename)
+
+            logger.info('Uploading done')
         try:
             self.update_package_fields()
         except ScormError as e:
             response["errors"].append(e.args[0])
-
+        logger.info('Submit done')
         return self.json_response(response)
 
     @property
@@ -212,7 +217,7 @@ class ScormXBlock(XBlock):
             # is stored in the base folder.
             folder = self.extract_folder_base_path
             logger.warning("Serving SCORM content from old-style path: %s", folder)
-        return default_storage.url(os.path.join(folder, self.index_page_path))
+        return os.path.join(self.lms_url, "media", folder, self.index_page_path)
 
     @property
     def package_path(self):
@@ -353,7 +358,7 @@ class ScormXBlock(XBlock):
                 resource = root.find("resources/resource")
                 schemaversion = root.find("metadata/schemaversion")
 
-            if resource:
+            if resource is not None:
                 self.index_page_path = resource.get("href")
             if (schemaversion is not None) and (
                 re.match("^1.2$", schemaversion.text) is None
@@ -395,6 +400,13 @@ class ScormXBlock(XBlock):
         file_descriptor.seek(0)
         return sha1.hexdigest()
 
+    @property
+    def lms_url(self):
+        scheme = 'https' if settings.HTTPS == 'on' else 'http'
+        return '{}://{}'.format(
+            scheme,
+            configuration_helpers.get_value('SITE_NAME', settings.SITE_NAME))
+
     def student_view_data(self):
         """
         Inform REST api clients about original file location and it's "freshness".
@@ -434,6 +446,11 @@ def recursive_delete(root):
         recursive_delete(os.path.join(root, directory))
     for f in files:
         default_storage.delete(os.path.join(root, f))
+
+
+def upload_file(extract_folder_path, root, rel_dir, filename):
+    with open(os.path.join(root, filename), 'rb') as src:
+        default_storage.save(os.path.join(extract_folder_path, rel_dir, filename), File(src))
 
 
 class ScormError(Exception):
