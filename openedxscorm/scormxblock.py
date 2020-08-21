@@ -4,13 +4,13 @@ import os
 import logging
 import re
 from concurrent import futures
+import mimetypes
 
 import tempfile
 import xml.etree.ElementTree as ET
 import zipfile
 
 from django.conf import settings
-from django.core.files import File
 from django.core.files.storage import default_storage
 from django.template import Context, Template
 from django.utils import timezone
@@ -21,6 +21,8 @@ from openedx.core.djangoapps.site_configuration import helpers as configuration_
 from web_fragments.fragment import Fragment
 from xblock.core import XBlock
 from xblock.fields import Scope, String, Float, Boolean, Dict, DateTime, Integer
+from google.cloud.storage import Client
+
 
 # Make '_' a no-op so we can scrape strings
 def _(text):
@@ -100,6 +102,11 @@ class ScormXBlock(XBlock):
 
     has_author_view = True
 
+    gs_project_id = getattr(settings, 'GS_PROJECT_ID', None)
+    gs_credentials = getattr(settings, 'GS_CREDENTIALS', None)
+    gs_bucket_name = settings.GS_BUCKET_NAME
+    gs_default_acl = settings.GS_DEFAULT_ACL
+
     def render_template(self, template_path, context):
         template_str = self.resource_string(template_path)
         template = Template(template_str)
@@ -178,26 +185,42 @@ class ScormXBlock(XBlock):
         package_file = request.params["file"].file
         self.update_package_meta(package_file)
 
-        if default_storage.exists(self.extract_folder_base_path):
-            logger.info(
-                'Removing previously uploaded "%s"', self.extract_folder_base_path
-            )
-            recursive_delete(self.extract_folder_base_path)
-
         with tempfile.TemporaryDirectory() as tempdir:
             logger.info('Scorm "%s" unpacked to "%s"', package_file, tempdir)
             with zipfile.ZipFile(package_file, "r") as scorm_zipfile:
                 scorm_zipfile.extractall(tempdir)
 
-            logger.info('Starting uploading files')
+            logger.info('Starting uploading files to %s', self.extract_folder_path)
 
+            uploaded_counter = 0
+            failed_counter = 0
+            storage_client = Client(
+                            project=self.gs_project_id,
+                            credentials=self.gs_credentials,
+                            )
+            bucket = storage_client.bucket(self.gs_bucket_name)
             with futures.ThreadPoolExecutor(max_workers=min(32, os.cpu_count() + 4)) as p:
+                tf = []
                 for root, subs, files in os.walk(tempdir):
                     rel_dir = os.path.relpath(root, tempdir)
                     for filename in files:
-                        p.submit(upload_file, self.extract_folder_path, root, rel_dir, filename)
+                        tf.append(
+                            p.submit(
+                                upload_file,
+                                bucket,
+                                self.extract_folder_path,
+                                root, rel_dir, filename,
+                                self.gs_default_acl
+                            )
+                        )
+                for f in futures.as_completed(tf):
+                    if f.result():
+                        uploaded_counter += 1
+                    else: 
+                        failed_counter += 1
 
-            logger.info('Uploading done')
+            logger.info('Uploading done [ uploaded/failed %d/%d ]', uploaded_counter, failed_counter)
+
         try:
             self.update_package_fields()
         except ScormError as e:
@@ -435,22 +458,16 @@ class ScormXBlock(XBlock):
         ]
 
 
-def recursive_delete(root):
-    """
-    Recursively delete the contents of a directory in the Django default storage.
-    Unfortunately, this will not delete empty folders, as the default FileSystemStorage
-    implementation does not allow it.
-    """
-    directories, files = default_storage.listdir(root)
-    for directory in directories:
-        recursive_delete(os.path.join(root, directory))
-    for f in files:
-        default_storage.delete(os.path.join(root, f))
-
-
-def upload_file(extract_folder_path, root, rel_dir, filename):
+def upload_file(bucket, extract_folder_path, root, rel_dir, filename, gs_default_acl):
+    upload_path = os.path.normpath(os.path.join(extract_folder_path, rel_dir, filename))
+    blob = bucket.blob(upload_path)
     with open(os.path.join(root, filename), 'rb') as src:
-        default_storage.save(os.path.join(extract_folder_path, rel_dir, filename), File(src))
+        blob.upload_from_file(src,
+                              content_type=mimetypes.guess_type(filename)[0],
+                              rewind=True,
+                              predefined_acl=gs_default_acl
+                              )
+    return blob.exists()
 
 
 class ScormError(Exception):
